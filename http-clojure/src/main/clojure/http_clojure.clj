@@ -8,11 +8,15 @@
 (import '(java.nio.channels SelectionKey))
 (import '(java.nio.channels SocketChannel))
 (import '(java.nio.charset Charset))
-(import '(java.util.concurrent Callable))
+(import '(java.util.concurrent Executors))
+(import '(javax.net.ssl SSLContext))
+(import '(javax.net.ssl SSLEngine))
+(import '(javax.net.ssl SSLEngineResult$HandshakeStatus))
 (import '(org.apache.commons.codec.binary Base64))
 
 (defrecord http-request [uri method headers body])
 (defrecord http-response [request status status-msg headers body])
+(defrecord http-error [request result])
 
 (def http-client-version "0.0.0")
 
@@ -24,10 +28,31 @@
   (fn [params]
     (clojure.string/join "&"
                          (map #(clojure.string/join "="
-                                                     (map
-                                                       url-encode
-                                                       %))
+                                                    (map
+                                                      url-encode
+                                                      %))
                               params))))
+
+(defprotocol BufferList
+  (get-buffers [_])
+  (add-buffer [_ buffer])
+  (size [_])
+  (to-seq [_]))
+
+(defn align [n m]
+  (case (mod n m)
+    0 n
+    (+ n (- m (mod n m)))))
+
+(defn grow [buffer need]
+  (if (nil? buffer)
+    (ByteBuffer/allocate (align need 1024))
+    (if (> need (.remaining buffer))
+      (.put (ByteBuffer/allocate (align need 1024)) (.flip (.duplicate buffer)))
+      buffer)))
+
+(defn dupe [buffer]
+  (.flip (.put (ByteBuffer/allocate (.remaining buffer)) buffer)))
 
 (defn asbuffers [value]
   (let [value-type (class value)]
@@ -38,26 +63,61 @@
       :else [])))
 
 (defn dispatch-io [client key]
-  (cond (.isConnectable key) nil
-        (.isWritable key) nil
-        (.isReadable key) nil))
+  (cond (.isConnectable key) (connect (.getAttachment key) key)
+        (.isWritable key) (write (.getAttachment key) key)
+        (.isReadable key) (read (.getAttachment key) key)))
 
 (defprotocol HttpConn
-  (read [this])
-  (write [this])
-  (connect [this]))
+  (read [this key])
+  (write [this key])
+  (connect [this key]))
 
-(deftype http-conn [client]
+(deftype http-conn [client request channel response-promise ^{:volatile-mutable true} buffer]
   HttpConn
-  (read [this] ())
-  (write [this] ())
-  (connect [this] ()))
+  (read [this k]
+        (do
+          (set! buffer (grow buffer 1024))
+          (let [n (.read channel buffer)]
+            (cond
+              (< n 0) (deliver response-promise (http-error. request "read failed"))
+              (= n 0) nil
+              (> n 0) nil))))
+  (write [this k]
+         (let [buf (first (filter #(> (.remaining %) 0) (:body request)))]
+           (case buf
+             nil (.interestOps k SelectionKey/OP_READ)
+             (.write channel buf))))
+  (connect [this k]
+           (if (.finishConnect channel)
+             (.interestOps k SelectionKey/OP_WRITE)
+             (deliver response-promise (http-error. request "could not connect to host")))))
 
-(deftype https-conn [client context]
+(deftype https-conn [client request channel engine response-promise ^{:volatile-mutable true} buffer]
   HttpConn
-  (read [this] ())
-  (write [this] ())
-  (connect [this] ()))
+  (read [this k]
+        (case (.getHandshakeStatus engine)
+          SSLEngineResult$HandshakeStatus/NEED_UNWRAP (do
+                                                        (set! buffer (grow buffer 1024))
+                                                        (.read channel buffer)
+                                                        (.unwrap engine (.flip buffer))
+                                                        (.compact buffer))
+          SSLEngineResult$HandshakeStatus/NEED_WRAP (.interestOps k SelectionKey/OP_WRITE)
+          SSLEngineResult$HandshakeStatus/NEED_TASK (.run (.getDelegatedTask engine))
+          SSLEngineResult$HandshakeStatus/NOT_HANDSHAKING (do
+                                                            (set! buffer (grow buffer 1024))
+                                                            (.read channel buffer)
+                                                            (.unwrap engine buffer))))
+  (write [this k] ())
+  (connect [this k]
+           (if (.finishConnect channel)
+             (do
+               (.beginHandshake engine)
+               (case (.getHandshakeStatus engine)
+                 SSLEngineResult$HandshakeStatus/NEED_WRAP (.interestOps k SelectionKey/OP_WRITE)
+                 SSLEngineResult$HandshakeStatus/NEED_UNWRAP (.interestOps k SelectionKey/OP_READ)
+                 SSLEngineResult$HandshakeStatus/NEED_TASK (.run (.getDelegatedTask engine))
+                 SSLEngineResult$HandshakeStatus/NOT_HANDSHAKING (.interestOps k SelectionKey/OP_WRITE)))
+             (deliver response-promise (http-error. request "could not connect to host")))))
 
 (defn io-loop [client]
   (fn []
@@ -83,12 +143,45 @@
                                          " HTTP/1.1\r\n"))
                          (asbuffers (str (clojure.string/join
                                            "\r\n"
-                                           (map #(str (first  %) ": " (second %)) headers))
+                                           (map #(str (first  %) ": " (second %)) headers)
                                          "\r\n\r\n"))
-                         body-buffers)]
+                         body-buffers))
+            request-promise (promise)]
         (case (.getProtocol (:uri request))
-          "http" ()
-          "https" ())
+          "http" ((let [host (.getHost (:uri request))
+                        port (if (> (.getPort (:uri request)) 0)
+                               (.getPort (:uri request))
+                               80)]
+                    (let [conn (http-conn. client request (SocketChannel/open) request-promise (buffer-list. ()))]
+                    (do
+                      (.configureBlocking (.socket (:channel conn)) false)
+                      (.connect 
+                        (:channel conn)
+                        (InetSocketAddress. host port))
+                      (.register (:channel conn)
+                        (:selector client)
+                        SelectionKey/OP_CONNECT
+                        conn)))))
+          "https" ((let [host (.getHost (:uri request))
+                         port (if (> (.getPort (:uri request)) 0)
+                                (.getPort (:uri request))
+                                443)]
+                     (let [conn (https-conn. client
+                                             request
+                                             (SocketChannel/open)
+                                             (.createSSLEngine
+                                               (or (:sslcontext client) (SSLContext/getDefault))
+                                               host port)
+                                             request-promise
+                                             (buffer-list. ()))]
+                       (do
+                         (.configureBlocking (.socket (:channel conn)) false)
+                         (.connect (:channel conn)
+                           (InetSocketAddress. host port))
+                         (.register (:channel conn)
+                           (:selector client)
+                           SelectionKey/OP_CONNECT
+                           conn))))))
         (print (map #(.toString (.decode (Charset/forName "UTF-8") (.duplicate %))) bufs))
         bufs))))
 
@@ -107,7 +200,7 @@
   (delete [this uri headers auth]        "Perform a DELETE on uri, optionally with headers.")
   (start  [this]                         "Start the IO loop."))
 
-(defrecord client [executor selector]
+(defrecord client [executor selector sslcontext]
   HttpClient
   (get [this uri headers auth]
        (dorequest this
@@ -140,3 +233,9 @@
                                     nil)))
   (start [this]
          (.submit executor (io-loop this))))
+
+(defn make-http-client [& nthreads]
+  (client. (Executors/newCachedThreadPool (or nthreads (* (.availableProcessors (Runtime/getRuntime)) 2)))
+           (Selector/open)
+           (SSLContext/getDefault)))
+               
